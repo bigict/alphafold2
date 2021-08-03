@@ -650,18 +650,18 @@ def prot_covalent_bond(seqs, adj_degree=1, cloud_mask=None, mat=True, sparse=Fal
         return edge_idxs.to(seqs.device), edge_types.to(seqs.device)
 
 
-def sidechain_container(seqs, backbones, atom_mask, cloud_mask=None, padding_tok=20):
+def sidechain_container(seqs, backbones, atom_mask, cloud_mask=None, padding_tok=20,num_coords_per_res=NUM_COORDS_PER_RES):
     """ Gets a backbone of the protein, returns the whole coordinates
         with sidechains (same format as sidechainnet). Keeps differentiability.
         Inputs: 
         * seqs: (batch, L) either tensor or list
         * backbones: (batch, L*n_aa, 3): assume batch=1 (could be extended (?not tested)).
                      Coords for (N-term, C-alpha, C-term, (c_beta)) of every aa.
-        * atom_mask: (14,). int or bool tensor specifying which atoms are passed.
+        * atom_mask: (num_coords_per_res,). int or bool tensor specifying which atoms are passed.
         * cloud_mask: (batch, l, c). optional. cloud mask from scn_cloud_mask`.
                       sets point outside of mask to 0. if passed, else c_alpha
         * padding: int. padding token. same as in sidechainnet: 20
-        Outputs: whole coordinates of shape (batch, L, 14, 3)
+        Outputs: whole coordinates of shape (batch, L, num_coords_per_res, 3)
     """
     atom_mask = atom_mask.bool().cpu().detach()
     cum_atom_mask = atom_mask.cumsum(dim=-1).tolist()
@@ -671,7 +671,7 @@ def sidechain_container(seqs, backbones, atom_mask, cloud_mask=None, padding_tok
     predicted  = rearrange(backbones, 'b (l back) d -> b l back d', l=length)
 
     # early check if whole chain is already pred
-    if cum_atom_mask[-1] == 14:
+    if cum_atom_mask[-1] == num_coords_per_res:
         return predicted
 
     # build scaffold from (N, CA, C, CB) - do in cpu

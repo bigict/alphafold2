@@ -157,7 +157,7 @@ class Attention(nn.Module):
             context_mask = mask if not has_context else default(context_mask, lambda: torch.ones(1, k.shape[-2], device = device).bool())
             mask_value = -torch.finfo(dots.dtype).max
             mask = mask[:, None, :, None] * context_mask[:, None, None, :]
-            dots = dots.masked_fill(~mask, mask_value)
+            dots = dots.masked_fill(~mask.bool(), mask_value)
 
         # attention
 
@@ -597,8 +597,9 @@ class Alphafold2(nn.Module):
     def forward(
         self,
         seq,
-        msa = None,
         mask = None,
+        embedds = None,
+        msa = None,
         msa_mask = None,
         extra_msa = None,
         extra_msa_mask = None,
@@ -608,7 +609,6 @@ class Alphafold2(nn.Module):
         templates_feats = None,
         templates_mask = None,
         templates_angles = None,
-        embedds = None,
         recyclables = None,
         return_trunk = False,
         return_confidence = False,

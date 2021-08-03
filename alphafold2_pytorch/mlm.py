@@ -16,7 +16,7 @@ def get_mask_subset_with_prob(mask, prob):
     mask_excess = (mask.cumsum(dim=-1) > (num_tokens * prob).ceil())
     mask_excess = mask_excess[:, :max_masked]
 
-    rand = torch.rand((batch, seq_len), device=device).masked_fill(~mask, -1e9)
+    rand = torch.rand((batch, seq_len), device=device).masked_fill(~mask.bool(), -1e9)
     _, sampled_indices = rand.topk(max_masked, dim=-1)
     sampled_indices = (sampled_indices + 1).masked_fill_(mask_excess, 0)
 
