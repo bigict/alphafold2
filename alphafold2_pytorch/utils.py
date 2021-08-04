@@ -117,7 +117,7 @@ def get_atom_ids_dict():
 
 def make_cloud_mask(aa):
     """ relevent points will be 1. paddings will be 0. """
-    mask = np.zeros(constants.NUM_COORDS_PER_RES)
+    mask = np.zeros(NUM_COORDS_PER_RES)
     # early stop if padding token
     if aa == "_":
         return mask
@@ -128,7 +128,7 @@ def make_cloud_mask(aa):
 
 def make_atom_id_embedds(aa, atom_ids):
     """ Return the tokens for each atom in the aa. """
-    mask = np.zeros(constants.NUM_COORDS_PER_RES)
+    mask = np.zeros(NUM_COORDS_PER_RES)
     # early stop if padding token
     if aa == "_":
         return mask
@@ -433,7 +433,7 @@ def scn_cloud_mask(scn_seq, boolean=True, coords=None):
     scn_seq = expand_dims_to(scn_seq, 2 - len(scn_seq.shape))
     # early check for coords mask
     if coords is not None: 
-        batch_mask = ( rearrange(coords, '... (l c) d -> ... l c d', c=constants.NUM_COORDS_PER_RES) == 0 ).sum(dim=-1) < coords.shape[-1]
+        batch_mask = ( rearrange(coords, '... (l c) d -> ... l c d', c=NUM_COORDS_PER_RES) == 0 ).sum(dim=-1) < coords.shape[-1]
         if boolean:
             return batch_mask.bool()
         else: 
@@ -675,7 +675,7 @@ def sidechain_container(seqs, backbones, atom_mask, cloud_mask=None, padding_tok
         return predicted
 
     # build scaffold from (N, CA, C, CB) - do in cpu
-    new_coords = torch.zeros(batch, length, constants.NUM_COORDS_PER_RES, 3)
+    new_coords = torch.zeros(batch, length, NUM_COORDS_PER_RES, 3)
     predicted  = predicted.cpu() if predicted.is_cuda else predicted
 
     # fill atoms if they have been passed

@@ -115,15 +115,15 @@ def main(args):
     
             backbones = model(
                 seq,
-                msa = msa,
+                mask = mask,
                 embedds = embedds,
-                mask = mask
+                msa = msa
             )
     
-            if it == 0 and jt == 0:
-                with SummaryWriter(os.path.join(args.prefix, 'runs', 'netword')) as w:
-                    w.add_graph(model, (seq, mask, embedds))
-    
+            if it == 0 and jt == 0 and args.tensorboard_add_graph:
+                with SummaryWriter(os.path.join(args.prefix, 'runs', 'network')) as w:
+                    w.add_graph(model, (seq, mask, embedds), verbose=True)
+   
             # atom mask
             #_, atom_mask, _ = scn_backbone_mask(seq, boolean=True)
             atom_mask = torch.zeros(NUM_COORDS_PER_RES).to(seq.device)
@@ -189,6 +189,7 @@ if __name__ == '__main__':
     parser.add_argument('-b', '--batch-size', type=int, default=1, help='batch size, default=1')
     parser.add_argument('-l', '--learning-rate', type=float, default='3e-4', help='learning rate, default=3e-4')
 
+    parser.add_argument('--tensorboard-add-graph', action='store_true', help='call tensorboard.add_graph')
     parser.add_argument('--save-pdb', action='store_true', help='save pdb')
     parser.add_argument('-v', '--verbose', action='store_true', help='verbose')
     args = parser.parse_args()
