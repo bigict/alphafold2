@@ -620,13 +620,13 @@ class Alphafold2(nn.Module):
 
         # if MSA is not passed in, just use the sequence itself
 
-        if not exists(msa):
+        if not exists(embedds) and not exists(msa):
             msa = rearrange(seq, 'b n -> b () n')
             msa_mask = rearrange(mask, 'b n -> b () n')
 
         # assert on sequence length
 
-        assert msa.shape[-1] == seq.shape[-1], 'sequence length of MSA and primary sequence must be the same'
+        assert not exists(msa) or msa.shape[-1] == seq.shape[-1], 'sequence length of MSA and primary sequence must be the same'
 
         # variables
 
@@ -791,10 +791,9 @@ class Alphafold2(nn.Module):
 
         # calculate mlm loss, if training
 
-        msa_mlm_loss = None
         if self.training and exists(msa):
             num_msa = original_msa.shape[1]
-            msa_mlm_loss = self.mlm(m[:, :num_msa], original_msa, replaced_msa_mask)
+            ret.msa_mlm_loss = self.mlm(m[:, :num_msa], original_msa, replaced_msa_mask)
 
         # determine angles, if specified
 
@@ -845,7 +844,8 @@ class Alphafold2(nn.Module):
                 quaternion_update, translation_update = self.to_quaternion_update(single_repr).chunk(2, dim = -1)
                 quaternion_update = F.pad(quaternion_update, (1, 0), value = 1.)
 
-                quaternions = quaternions + quaternion_multiply(quaternions, quaternion_update)
+                #quaternions = quaternions + quaternion_multiply(quaternions, quaternion_update)
+                quaternions = quaternion_multiply(quaternions, quaternion_update)
                 translations = translations + einsum('b n c, b n c r -> b n r', translation_update, rotations)
 
             points_local = self.to_points(single_repr)

@@ -1,5 +1,8 @@
 import os
+import sys
 import argparse
+import logging
+import resource
 
 import torch
 from torch import nn
@@ -26,6 +29,9 @@ def main(args):
     DEVICE = constants.DEVICE # defaults to cuda if available, else cpu
     
     DISTOGRAM_BUCKETS = constants.DISTOGRAM_BUCKETS
+
+    if args.threads > 0:
+        torch.set_num_threads(args.threads)
     
     # set emebdder model from esm if appropiate - Load ESM-1b model
     
@@ -36,17 +42,22 @@ def main(args):
         except:
             # alternatively
             # from pytorch hub (almost 30gb)
-            embedd_model, alphabet = torch.hub.load("facebookresearch/esm", "esm1b_t33_650M_UR50S")
+            embedd_model, alphabet = torch.hub.load(*constants.ESM_MODEL_PATH)
         batch_converter = alphabet.get_batch_converter()
     
     # helpers
     
     def cycle(loader, cond = lambda x: True):
+        epoch = 0
         while True:
-            for data in loader:
-                if not cond(data):
-                    continue
-                yield data
+            logging.info('epoch: {}'.format(epoch))
+
+            data_iter = iter(loader)
+            for data in data_iter:
+                if cond(data):
+                    yield data
+
+            epoch += 1
     
     # get data
     
@@ -55,25 +66,32 @@ def main(args):
         thinning = 30,
         with_pytorch = 'dataloaders',
         batch_size = args.batch_size,
+        num_workers = 0,
         dynamic_batching = False
     )
     
-    data = iter(data['train'])
-    data_cond = lambda t: t[1].shape[1] < args.max_protein_len
-    dl = cycle(data, data_cond)
+    train_loader = data['train']
+    data_cond = lambda t: args.min_protein_len <= t[1].shape[1] and t[1].shape[1] <= args.max_protein_len
+    dl = cycle(train_loader, data_cond)
 
     # model
     
-    model = Alphafold2(
-        dim = 256,
-        depth = 1,
-        heads = 8,
-        dim_head = 64,
-        predict_coords = True,
-        structure_module_depth = 2,
-        structure_module_heads = 4,
-        structure_module_dim_head = 16
-    ).to(DEVICE)
+    if args.alphafold2_continue:
+        model = torch.load(os.path.join(args.prefix, 'model.pkl'))
+        mode.eval()
+        model.to(DEVICE)
+    else:
+        model = Alphafold2(
+            dim = args.alphafold2_dim,
+            depth = args.alphafold2_depth,
+            heads = 8,
+            dim_head = 64,
+            predict_coords = True,
+            predict_angles = True,
+            structure_module_depth = 2,
+            structure_module_heads = 4,
+            structure_module_dim_head = 16
+        ).to(DEVICE)
     #    structure_module_dim = 8,
     #    structure_module_refinement_iters = 2
 
@@ -92,6 +110,7 @@ def main(args):
         for jt in range(args.gradient_accumulate_every):
             batch = next(dl)
             seq, coords, mask = batch.seqs, batch.crds, batch.msks
+            logging.debug('seq.shape: {}'.format(seq.shape))
     
             # prepare data and mask labels
             seq, coords, mask = seq.argmax(dim = -1).to(DEVICE), coords.to(DEVICE), mask.to(DEVICE)
@@ -143,8 +162,6 @@ def main(args):
     
             # chain_mask is all atoms that will be backpropped thru -> existing + trainable 
     
-            #print('cloud_mask.shape', cloud_mask.shape)
-            #print('mask.shape', mask.shape)
             #chain_mask = (mask * cloud_mask)[cloud_mask]
             #flat_chain_mask = rearrange(chain_mask, 'b l c -> b (l c)')
     
@@ -162,11 +179,11 @@ def main(args):
             #                  dispersion_weight * torch.norm( (1/weights)-1 )
             #loss = torch.sqrt(criterion(coords_aligned, labels_aligned)) + \
             #                  dispersion_weight * torch.norm( (1/weights)-1 )
-            loss = torch.sqrt(criterion(coords_aligned, labels_aligned))
+            loss = torch.clamp(torch.sqrt(criterion(coords_aligned, labels_aligned)), args.alphafold2_fape_min, args.alphafold2_fape_max) / args.alphafold2_fape_z
     
             loss.backward()
     
-        print('loss:', loss.item())
+        logging.info('{} loss: {}'.format(it, loss.item()))
         writer.add_scalar('Loss/train', loss.item(), it)
     
         optim.step()
@@ -179,21 +196,51 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('-o', '--prefix', type=str, default='.', help='prefix of out directory, default=.')
+    parser.add_argument('-o', '--prefix', type=str, default='.', help='prefix of out directory, default=\'.\'')
     parser.add_argument('-C', '--casp-version', type=int, default=12, help='CASP version, default=12')
     parser.add_argument('-F', '--features', type=str, default='esm', help='AA residue features one of [esm,msa], default=esm')
-    parser.add_argument('-L', '--max-protein-len', type=int, default=250, help='filter out proteins whose length>=LEN, default=250')
+    parser.add_argument('-t', '--threads', type=int, default=0, help='number of threads used for intraop parallelism on CPU., default=0')
+    parser.add_argument('-m', '--min_protein_len', type=int, default=50, help='filter out proteins whose length<LEN, default=50')
+    parser.add_argument('-M', '--max_protein_len', type=int, default=1024, help='filter out proteins whose length>LEN, default=1024')
 
-    parser.add_argument('-n', '--num-batches', type=int, default=100000, help='number of batches, default=10^5')
-    parser.add_argument('-k', '--gradient-accumulate-every', type=int, default=16, help='accumulate grads every k times, default=16')
-    parser.add_argument('-b', '--batch-size', type=int, default=1, help='batch size, default=1')
-    parser.add_argument('-l', '--learning-rate', type=float, default='3e-4', help='learning rate, default=3e-4')
+    parser.add_argument('-n', '--num_batches', type=int, default=100000, help='number of batches, default=10^5')
+    parser.add_argument('-k', '--gradient_accumulate_every', type=int, default=16, help='accumulate grads every k times, default=16')
+    parser.add_argument('-b', '--batch_size', type=int, default=1, help='batch size, default=1')
+    parser.add_argument('-l', '--learning_rate', type=float, default='3e-4', help='learning rate, default=3e-4')
 
-    parser.add_argument('--tensorboard-add-graph', action='store_true', help='call tensorboard.add_graph')
-    parser.add_argument('--save-pdb', action='store_true', help='save pdb')
+    parser.add_argument('--alphafold2_dim', type=int, default=256, help='dimension of alphafold2, default=256')
+    parser.add_argument('--alphafold2_depth', type=int, default=1, help='depth of alphafold2, default=1')
+    parser.add_argument('--alphafold2_fape_min', type=float, default=1e-4, help='minimum of dij in alphafold2, default=1e-4')
+    parser.add_argument('--alphafold2_fape_max', type=float, default=10.0, help='maximum of dij in alphafold2, default=10.0')
+    parser.add_argument('--alphafold2_fape_z', type=float, default=10.0, help='Z of dij in alphafold2, default=10.0')
+    parser.add_argument('--alphafold2_continue', action='store_true', help='load a model and continue to train')
+
+    parser.add_argument('--tensorboard_add_graph', action='store_true', help='call tensorboard.add_graph')
+    parser.add_argument('--save_pdb', action='store_true', help='save pdb')
     parser.add_argument('-v', '--verbose', action='store_true', help='verbose')
     args = parser.parse_args()
-    print('-----------------')
-    print('Args: {}'.format(args))
-    print('-----------------')
+
+    # logging
+
+    if not os.path.exists(args.prefix):
+        os.makedirs(os.path.abspath(args.prefix))
+    logging.basicConfig(
+            format = '%(asctime)-15s [%(levelname)s] (%(filename)s:%(lineno)d) %(message)s',
+            level = logging.DEBUG if args.verbose else logging.INFO,
+            handlers = [
+                logging.StreamHandler(),
+                logging.FileHandler(os.path.join(args.prefix, '{}.log'.format(
+                    os.path.splitext(os.path.basename(__file__))[0])))
+            ]
+        )
+
+    logging.info('-----------------')
+    logging.info('Arguments: {}'.format(args))
+    logging.info('-----------------')
+
     main(args)
+
+    logging.info('-----------------')
+    logging.info('Resources(myself): {}'.format(resource.getrusage(resource.RUSAGE_SELF)))
+    logging.info('Resources(children): {}'.format(resource.getrusage(resource.RUSAGE_CHILDREN)))
+    logging.info('-----------------')
