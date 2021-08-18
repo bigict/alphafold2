@@ -189,9 +189,9 @@ def main(args):
         optim.step()
         optim.zero_grad()
 
-    # save model
     writer.close()
 
+    # save model
     torch.save(model, os.path.join(args.prefix, 'model.pkl'))
 
 if __name__ == '__main__':

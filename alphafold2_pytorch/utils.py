@@ -15,6 +15,7 @@ import string
 
 # sidechainnet
 
+import sidechainnet as scn
 from sidechainnet.utils.sequence import ProteinVocabulary, ONE_TO_THREE_LETTER_MAP
 from sidechainnet.utils.measure import GLOBAL_PAD_CHAR
 from sidechainnet.structure.build_info import NUM_COORDS_PER_RES, BB_BUILD_INFO, SC_BUILD_INFO
@@ -229,11 +230,18 @@ def coords2pdb(seq, coords, cloud_mask, prefix="", name="af2_struct.pdb"):
         * prefix: str. directory to save files.
         * name: str. name of destin file (ex: pred1.pdb)
     """
-    scaffold = torch.zeros( cloud_mask.shape, 3 )
+    scaffold = torch.zeros( *cloud_mask.shape, 3 )
     scaffold[cloud_mask] = coords.cpu().float()
     # build structures and save
     pred = scn.StructureBuilder( seq, crd=scaffold ) 
     pred.to_pdb(prefix+name)
+
+def coords2pdbstr(seq, coords, mask, title="pred"):
+    scaffold = torch.zeros( *mask.shape, 3 )
+    scaffold[mask] = coords.cpu().float()
+    # build structures and save
+    sb = scn.StructureBuilder( seq, crd=scaffold ) 
+    return sb.to_pdbstr(title=title)
 
 
 # adapted from https://github.com/facebookresearch/esm

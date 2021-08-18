@@ -24,6 +24,7 @@ setup(
     'pytorch3d',
     'requests',
     'sidechainnet',
+    'tmscoring',
     'torch>=1.6',
     'transformers',
     'tqdm',
