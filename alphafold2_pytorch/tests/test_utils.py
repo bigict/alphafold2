@@ -1,5 +1,9 @@
+import unittest
+
 import torch
 import numpy as np
+
+from alphafold2_pytorch.constants import *
 from alphafold2_pytorch.utils import *
 
 def test_mat_to_masked():
@@ -99,3 +103,37 @@ def test_gdt():
     b = torch.randn(1, 3, 8)
     GDT(a, b, weights = 1)
     assert True
+
+class TestUtils(unittest.TestCase):
+    def test_dist_loss(self):
+        X = torch.tensor([[1.0,2.0,3.0], [2.0,1.0,3.0]])
+        Y = torch.tensor([[1.0,2.0,3.0], [1.0,2.0,3.0]])
+        self.assertAlmostEqual(distmat_loss_torch(X, Y), 1.0, delta=1e-5)
+
+    def test_gdt(self):
+        a = np.array([[[1.0], [2.0], [3.0]]])
+        b = np.array([[[1.0], [2.0], [3.0]]])
+        r = GDT(a, b, weights = 1)
+        self.assertAlmostEqual(r, 1.0, delta=1e-5)
+
+        a = torch.from_numpy(a)
+        b = torch.from_numpy(b)
+        r = GDT(a, b, weights = 1)
+        self.assertAlmostEqual(r, 1.0, delta=1e-5)
+
+    def test_rmsd(self):
+        a = np.array([[[1.0], [2.0], [3.0]]])
+        b = np.array([[[1.0], [2.0], [3.0]]])
+        r = RMSD(a, b)
+        self.assertAlmostEqual(r, 0.0, delta=1e-5)
+
+        a = torch.from_numpy(a)
+        b = torch.from_numpy(b)
+        r = RMSD(a, b)
+        self.assertAlmostEqual(r, 0.0, delta=1e-5)
+
+    def test_tmscore(self):
+        pass
+
+if __name__ == '__main__':
+    unittest.main()

@@ -7,21 +7,15 @@ import resource
 import torch
 from torch import nn
 from torch.optim import Adam
-from torch.utils.data import DataLoader
-from torch.nn import functional as F
 from torch.utils.tensorboard import SummaryWriter
 from einops import rearrange
 
-# data
+# models & data
 
-import sidechainnet as scn
-from sidechainnet.structure.build_info import NUM_COORDS_PER_RES
-
-# models
-
-from alphafold2_pytorch import Alphafold2
-from alphafold2_pytorch.utils import *
 from alphafold2_pytorch import constants
+from alphafold2_pytorch.data import scn,esm
+from alphafold2_pytorch.model import Alphafold2,sidechain
+from alphafold2_pytorch.utils import *
 
 def main(args):
     # constants
@@ -36,14 +30,7 @@ def main(args):
     # set emebdder model from esm if appropiate - Load ESM-1b model
     
     if args.features == "esm":
-        try:
-            import esm # after installing esm
-            embedd_model, alphabet = esm.pretrained.esm1b_t33_650M_UR50S()
-        except:
-            # alternatively
-            # from pytorch hub (almost 30gb)
-            embedd_model, alphabet = torch.hub.load(*constants.ESM_MODEL_PATH)
-        batch_converter = alphabet.get_batch_converter()
+        esm_extractor = esm.ESMEmbeddingExtractor(*esm.ESM_MODEL_PATH)
     
     # helpers
     
@@ -54,14 +41,14 @@ def main(args):
 
             data_iter = iter(loader)
             for data in data_iter:
-                if cond(data):
-                    yield data
+                yield data
 
             epoch += 1
     
     # get data
     
     data = scn.load(
+        max_seq_len = args.max_protein_len,
         casp_version = args.casp_version,
         thinning = 30,
         with_pytorch = 'dataloaders',
@@ -107,13 +94,14 @@ def main(args):
     # training loop
     
     for it in range(args.num_batches):
+        running_loss = 0
         for jt in range(args.gradient_accumulate_every):
             batch = next(dl)
-            seq, coords, mask = batch.seqs, batch.crds, batch.msks
+            seq, mask, str_seqs, coords, coord_mask = batch['seq'], batch['mask'], batch['str_seq'], batch['coord'], batch['coord_mask']
             logging.debug('seq.shape: {}'.format(seq.shape))
     
             # prepare data and mask labels
-            seq, coords, mask = seq.argmax(dim = -1).to(DEVICE), coords.to(DEVICE), mask.to(DEVICE)
+            seq, coords, mask, coord_mask = seq.to(DEVICE), coords.to(DEVICE), mask.to(DEVICE), coord_mask.to(DEVICE)
             # coords = rearrange(coords, 'b (l c) d -> b l c d', l = l) # no need to rearrange for now
             # mask the atoms and backbone positions for each residue
     
@@ -122,7 +110,10 @@ def main(args):
     
             # get embedds
             if args.features == "esm":
-                embedds = get_esm_embedd(seq, embedd_model, batch_converter)
+                data = list(zip(batch['pid'], str_seqs))
+                embedds = rearrange(
+                        esm_extractor.extract(data, repr_layer=esm.ESM_EMBED_LAYER, device=DEVICE),
+                        'b l c -> b () l c')
             # get msa here
             elif args.features == "msa":
                 pass 
@@ -145,33 +136,28 @@ def main(args):
    
             # atom mask
             #_, atom_mask, _ = scn_backbone_mask(seq, boolean=True)
-            atom_mask = torch.zeros(NUM_COORDS_PER_RES).to(seq.device)
+            atom_mask = torch.zeros(scn.NUM_COORDS_PER_RES).to(seq.device)
             atom_mask[..., 1] = 1
-            cloud_mask = scn_cloud_mask(seq, boolean = True, coords=coords)
-            flat_cloud_mask = rearrange(cloud_mask, 'b l c -> b (l c)')
     
             ## build SC container. set SC points to CA and optionally place carbonyl O
-            proto_sidechain = sidechain_container(seq, backbones=backbones, atom_mask=atom_mask,
-                                                  cloud_mask=cloud_mask, num_coords_per_res=NUM_COORDS_PER_RES)
+            proto_sidechain = sidechain.fold(str_seqs, backbones=backbones, atom_mask=atom_mask,
+                                                  cloud_mask=coord_mask, num_coords_per_res=scn.NUM_COORDS_PER_RES)
     
-            proto_sidechain = rearrange(proto_sidechain, 'b l c d -> b (l c) d')
+            #proto_sidechain = rearrange(proto_sidechain, 'b l c d -> b (l c) d')
     
+            flat_cloud_mask = rearrange(coord_mask, 'b l c -> b (l c)')
             # rotate / align
-            coords_aligned, labels_aligned = Kabsch(proto_sidechain[flat_cloud_mask], coords[flat_cloud_mask])
-    
-    
-            # chain_mask is all atoms that will be backpropped thru -> existing + trainable 
-    
-            #chain_mask = (mask * cloud_mask)[cloud_mask]
-            #flat_chain_mask = rearrange(chain_mask, 'b l c -> b (l c)')
+            coords_aligned, labels_aligned = Kabsch(
+                    rearrange(proto_sidechain, 'b l c d -> b (l c) d')[flat_cloud_mask], 
+                    rearrange(coords, 'b l c d -> b (l c) d')[flat_cloud_mask])
     
             # save pdb files for visualization
     
-            if args.save_pdb: 
-                # idx from batch to save prot and label
-                idx = 0
-                coords2pdb(seq[idx, :, 0], coords_aligned[idx], cloud_mask, prefix=args.prefix, name="pred.pdb")
-                coords2pdb(seq[idx, :, 0], labels_aligned[idx], cloud_mask, prefix=args.prefix, name="label.pdb")
+            #if args.save_pdb: 
+            #    # idx from batch to save prot and label
+            #    idx = 0
+            #    coords2pdb(seq[idx, :, 0], coords_aligned[idx], cloud_mask, prefix=args.prefix, name="pred.pdb")
+            #    coords2pdb(seq[idx, :, 0], labels_aligned[idx], cloud_mask, prefix=args.prefix, name="label.pdb")
     
             weights = 1
             # loss - RMSE + distogram_dispersion
@@ -180,11 +166,13 @@ def main(args):
             #loss = torch.sqrt(criterion(coords_aligned, labels_aligned)) + \
             #                  dispersion_weight * torch.norm( (1/weights)-1 )
             loss = torch.clamp(torch.sqrt(criterion(coords_aligned, labels_aligned)), args.alphafold2_fape_min, args.alphafold2_fape_max) / args.alphafold2_fape_z
-    
+            running_loss += loss.item()
+
             loss.backward()
     
-        logging.info('{} loss: {}'.format(it, loss.item()))
-        writer.add_scalar('Loss/train', loss.item(), it)
+        running_loss /= (args.batch_size*args.gradient_accumulate_every)
+        logging.info('{} loss: {}'.format(it, running_loss))
+        writer.add_scalar('Loss/train', running_loss, it)
     
         optim.step()
         optim.zero_grad()

@@ -7,20 +7,12 @@ MAX_NUM_TEMPLATES = 10
 NUM_AMINO_ACIDS = 21
 NUM_EMBEDDS_TR = 1280 # best esm model 
 NUM_EMBEDDS_T5 = 1024 # best t5 model 
-#NUM_COORDS_PER_RES = 14
+NUM_COORDS_PER_RES = 14
 
 DISTOGRAM_BUCKETS = 37
 THETA_BUCKETS = 25
 PHI_BUCKETS = 13
 OMEGA_BUCKETS = 25
-
-# embedding related constants
-
-MSA_EMBED_DIM = 768
-MSA_MODEL_PATH = ["facebookresearch/esm", "esm_msa1_t12_100M_UR50S"]
-
-ESM_EMBED_DIM = 1280
-ESM_MODEL_PATH = ["facebookresearch/esm", "esm1b_t33_650M_UR50S"]
 
 PROTTRAN_EMBED_DIM = 1024
 

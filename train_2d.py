@@ -11,24 +11,19 @@ from torch.nn import functional as F
 from torch.utils.tensorboard import SummaryWriter
 from einops import rearrange
 
-# data
-
-import sidechainnet as scn
-from sidechainnet.structure.build_info import NUM_COORDS_PER_RES
-
-# models
-
-from alphafold2_pytorch import Alphafold2
-from alphafold2_pytorch.common import residue_constants
-from alphafold2_pytorch.utils import *
 from alphafold2_pytorch import constants
+from alphafold2_pytorch.common import residue_constants
+from alphafold2_pytorch.data import esm,scn
+from alphafold2_pytorch.model import Alphafold2
+from alphafold2_pytorch.utils import *
 
 def pseudo_beta_fn(aatype, all_atom_positions, all_atom_masks):
   """Create pseudo beta features."""
 
-  #all_atom_positions = all_atom_positions.reshape(:, NUM_COORDS_PER_RES, ...)
-  all_atom_positions = torch.split(all_atom_positions, NUM_COORDS_PER_RES, dim=1)
-  all_atom_positions = torch.stack(all_atom_positions, dim=1)
+  #all_atom_positions = all_atom_positions.reshape(:, scn.NUM_COORDS_PER_RES, ...)
+  #all_atom_positions = rearrange(all_atom_positions, 'b (l c) d -> b l c d', c=scn.NUM_COORDS_PER_RES)
+  #all_atom_positions = torch.split(all_atom_positions, scn.NUM_COORDS_PER_RES, dim=1)
+  #all_atom_positions = torch.stack(all_atom_positions, dim=1)
   is_gly = torch.eq(aatype, residue_constants.restype_order['G'])
   ca_idx = residue_constants.atom_order['CA']
   cb_idx = residue_constants.atom_order['CB']
@@ -45,63 +40,18 @@ def pseudo_beta_fn(aatype, all_atom_positions, all_atom_masks):
   else:
     return pseudo_beta
 
-def softmax_cross_entropy(logits, labels):
-  """Computes softmax cross entropy given logits and one-hot class labels."""
-  loss = -torch.sum(labels * F.log_softmax(logits, dim=-1), dim=-1)
-  return loss
-
-def distogram_log_loss(logits, bin_edges, batch, num_bins):
-  """Log loss of a distogram."""
-
-  assert len(logits.shape) == 3
-  positions = batch['pseudo_beta']
-  mask = batch['pseudo_beta_mask']
-
-  assert positions.shape[-1] == 3
-
-  sq_breaks = torch.square(bin_edges)
-
-  dist2 = torch.sum(
-      torch.square(
-          rearrange(positions, 'l c -> l () c') -
-          rearrange(positions, 'l c -> () l c')),
-      dim=-1,
-      keepdims=True)
-
-  true_bins = torch.sum(dist2 > sq_breaks, axis=-1)
-
-  errors = softmax_cross_entropy(
-      labels=F.one_hot(true_bins, num_bins), logits=logits)
-
-
-  square_mask = rearrange(mask, 'l -> () l') * rearrange(mask, 'l -> l ()')
-
-  avg_error = (
-      torch.sum(errors * square_mask, dim=(-2, -1)) /
-      (1e-6 + torch.sum(square_mask, dim=(-2, -1))))
-  return avg_error
-
 def main(args):
     # constants
     
     DEVICE = constants.DEVICE # defaults to cuda if available, else cpu
     
-    DISTOGRAM_BUCKETS = constants.DISTOGRAM_BUCKETS
-
     if args.threads > 0:
         torch.set_num_threads(args.threads)
     
     # set emebdder model from esm if appropiate - Load ESM-1b model
     
     if args.features == "esm":
-        try:
-            import esm # after installing esm
-            embedd_model, alphabet = esm.pretrained.esm1b_t33_650M_UR50S()
-        except:
-            # alternatively
-            # from pytorch hub (almost 30gb)
-            embedd_model, alphabet = torch.hub.load(*constants.ESM_MODEL_PATH)
-        batch_converter = alphabet.get_batch_converter()
+        esm_extractor = esm.ESMEmbeddingExtractor(*esm.ESM_MODEL_PATH)
     
     # helpers
     
@@ -129,7 +79,7 @@ def main(args):
     )
     
     train_loader = data['train']
-    data_cond = lambda t: args.min_protein_len <= t[1].shape[1] and t[1].shape[1] <= args.max_protein_len
+    data_cond = lambda t: True #args.min_protein_len <= t[1].shape[1] and t[1].shape[1] <= args.max_protein_len
     dl = cycle(train_loader, data_cond)
 
     # model
@@ -148,31 +98,33 @@ def main(args):
             predict_angles = False,
             structure_module_depth = 2,
             structure_module_heads = 4,
-            structure_module_dim_head = 16
+            structure_module_dim_head = 16,
+            headers = {'distogram': ({'dim': args.alphafold2_dim,
+                    'first_break': 2.3125, 
+                    'last_break': 21.6875,
+                    'num_buckets': constants.DISTOGRAM_BUCKETS}, {'weigth': 1.0})}
         ).to(DEVICE)
     #    structure_module_dim = 8,
     #    structure_module_refinement_iters = 2
 
     # optimizer 
     
-    dispersion_weight = 0.1
-    criterion = nn.MSELoss()
     optim = Adam(model.parameters(), lr = args.learning_rate)
     
     # tensorboard
     writer = SummaryWriter(os.path.join(args.prefix, 'runs', 'eval'))
     
-    bin_edges = torch.linspace(2.3125, 21.6875, constants.DISTOGRAM_BUCKETS-1)
     # training loop
     
     for it in range(args.num_batches):
+        running_loss = 0
         for jt in range(args.gradient_accumulate_every):
             batch = next(dl)
-            seq, coords, mask = batch.seqs, batch.crds, batch.msks
+            pids, seq, mask, str_seqs, coords, coord_masks = batch['pid'], batch['seq'], batch['mask'], batch['str_seq'], batch['coord'], batch['coord_mask']
             logging.debug('seq.shape: {}'.format(seq.shape))
     
             # prepare data and mask labels
-            seq, coords, mask = seq.argmax(dim = -1).to(DEVICE), coords.to(DEVICE), mask.to(DEVICE)
+            seq, mask, coords, coord_masks = seq.to(DEVICE), mask.to(DEVICE), coords.to(DEVICE), coord_masks.to(DEVICE)
             # coords = rearrange(coords, 'b (l c) d -> b l c d', l = l) # no need to rearrange for now
             # mask the atoms and backbone positions for each residue
     
@@ -181,7 +133,10 @@ def main(args):
     
             # get embedds
             if args.features == "esm":
-                embedds = get_esm_embedd(seq, embedd_model, batch_converter)
+                data = list(zip(pids, str_seqs))
+                embedds = rearrange(
+                        esm_extractor.extract(data, repr_layer=esm.ESM_EMBED_LAYER, device=DEVICE),
+                        'b l c -> b () l c')
             # get msa here
             elif args.features == "msa":
                 pass 
@@ -189,13 +144,17 @@ def main(args):
             else:
                 pass
     
+            pseudo_beta, pseudo_beta_mask = pseudo_beta_fn(seq, coords, coord_masks)
+            batch = {'pseudo_beta': pseudo_beta,
+                    'pseudo_beta_mask': pseudo_beta_mask}
             # predict - out is (batch, L * 3, 3)
     
             r = model(
                 seq,
                 mask = mask,
                 embedds = embedds,
-                msa = msa
+                msa = msa,
+                batch = batch
             )
     
             if it == 0 and jt == 0 and args.tensorboard_add_graph:
@@ -204,24 +163,17 @@ def main(args):
    
             # atom mask
             #_, atom_mask, _ = scn_backbone_mask(seq, boolean=True)
-            atom_mask = torch.zeros(NUM_COORDS_PER_RES).to(seq.device)
+            atom_mask = torch.zeros(scn.NUM_COORDS_PER_RES).to(seq.device)
             atom_mask[..., 1] = 1
-            cloud_mask = scn_cloud_mask(seq, boolean = True, coords=coords)
-            flat_cloud_mask = rearrange(cloud_mask, 'b l c -> b (l c)')
-
-            pseudo_beta, pseudo_beta_mask = pseudo_beta_fn(seq, coords, cloud_mask)
 
             # loss - distogram_dispersion
-            #loss = torch.clamp(torch.sqrt(criterion(coords_aligned, labels_aligned)), args.alphafold2_fape_min, args.alphafold2_fape_max) / args.alphafold2_fape_z
-
-            loss = sum([distogram_log_loss(r.distance[i,:], bin_edges, 
-                    {'pseudo_beta': pseudo_beta[i,:], 'pseudo_beta_mask': pseudo_beta_mask[i,:]}, constants.DISTOGRAM_BUCKETS) for i in range(args.batch_size)])
-            loss /= args.batch_size
+            running_loss += r.loss.item()
+            r.loss.backward()
     
-            loss.backward()
-    
-        logging.info('{} loss: {}'.format(it, loss.item()))
-        writer.add_scalar('Loss/train', loss.item(), it)
+        running_loss /= (args.gradient_accumulate_every*args.batch_size)
+        logging.info('{} loss: {}'.format(it, running_loss))
+        writer.add_scalar('Loss/train', running_loss, it)
+        running_loss = 0
     
         optim.step()
         optim.zero_grad()
