@@ -132,6 +132,8 @@ def main(args):
     data_cond = lambda t: args.min_protein_len <= t[1].shape[1] and t[1].shape[1] <= args.max_protein_len
     dl = cycle(train_loader, data_cond)
 
+    esm_extractor = ESMEmbeddingExtractor(*constants.ESM_MODEL_PATH)
+
     # model
     
     if args.alphafold2_continue:
@@ -166,10 +168,17 @@ def main(args):
     # training loop
     
     for it in range(args.num_batches):
+        running_loss = 0
         for jt in range(args.gradient_accumulate_every):
             batch = next(dl)
+            #data = list(zip(batch.pids, batch.str_seqs))
+            #embedds = esm_extractor.extract(data, constants.ESM_EMBED_LAYER)
             seq, coords, mask = batch.seqs, batch.crds, batch.msks
             logging.debug('seq.shape: {}'.format(seq.shape))
+            print(batch.crds)
+            print(batch.crds.shape)
+            print(batch.crds.shape[-1])
+            sys.exit(0)
     
             # prepare data and mask labels
             seq, coords, mask = seq.argmax(dim = -1).to(DEVICE), coords.to(DEVICE), mask.to(DEVICE)
@@ -216,12 +225,16 @@ def main(args):
 
             loss = sum([distogram_log_loss(r.distance[i,:], bin_edges, 
                     {'pseudo_beta': pseudo_beta[i,:], 'pseudo_beta_mask': pseudo_beta_mask[i,:]}, constants.DISTOGRAM_BUCKETS) for i in range(args.batch_size)])
+
+            running_loss += loss.item()
+
             loss /= args.batch_size
-    
             loss.backward()
     
-        logging.info('{} loss: {}'.format(it, loss.item()))
-        writer.add_scalar('Loss/train', loss.item(), it)
+        running_loss /= (args.gradient_accumulate_every*args.batch_size)
+        logging.info('{} loss: {}'.format(it, running_loss))
+        writer.add_scalar('Loss/train', running_loss, it)
+        running_loss = 0
     
         optim.step()
         optim.zero_grad()

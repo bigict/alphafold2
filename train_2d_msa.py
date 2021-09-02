@@ -8,6 +8,7 @@ import torch
 from torch import nn
 from torch.optim import Adam
 from torch.nn import functional as F
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from einops import rearrange
 
@@ -20,6 +21,7 @@ from sidechainnet.structure.build_info import NUM_COORDS_PER_RES
 
 from alphafold2_pytorch import Alphafold2
 from alphafold2_pytorch.common import residue_constants
+from alphafold2_pytorch.data import dataset
 from alphafold2_pytorch.utils import *
 from alphafold2_pytorch import constants
 
@@ -93,15 +95,15 @@ def main(args):
     
     # set emebdder model from esm if appropiate - Load ESM-1b model
     
-    if args.features == "esm":
-        try:
-            import esm # after installing esm
-            embedd_model, alphabet = esm.pretrained.esm1b_t33_650M_UR50S()
-        except:
-            # alternatively
-            # from pytorch hub (almost 30gb)
-            embedd_model, alphabet = torch.hub.load(*constants.ESM_MODEL_PATH)
-        batch_converter = alphabet.get_batch_converter()
+    #if args.features == "esm":
+    #    try:
+    #        import esm # after installing esm
+    #        embedd_model, alphabet = esm.pretrained.esm1b_t33_650M_UR50S()
+    #    except:
+    #        # alternatively
+    #        # from pytorch hub (almost 30gb)
+    #        embedd_model, alphabet = torch.hub.load(*constants.ESM_MODEL_PATH)
+    #    batch_converter = alphabet.get_batch_converter()
     
     # helpers
     
@@ -119,17 +121,11 @@ def main(args):
     
     # get data
     
-    data = scn.load(
-        casp_version = args.casp_version,
-        thinning = 30,
-        with_pytorch = 'dataloaders',
-        batch_size = args.batch_size,
-        num_workers = 0,
-        dynamic_batching = False
-    )
-    
-    train_loader = data['train']
-    data_cond = lambda t: args.min_protein_len <= t[1].shape[1] and t[1].shape[1] <= args.max_protein_len
+    train_loader = dataset.load(args.casp_version,
+            max_seq_length = args.max_protein_len,
+            batch_size = args.batch_size,
+            num_workers = 0)
+    data_cond = lambda t: True #args.min_protein_len <= t[1].shape[1] and t[1].shape[1] <= args.max_protein_len
     dl = cycle(train_loader, data_cond)
 
     # model
@@ -167,7 +163,16 @@ def main(args):
     
     for it in range(args.num_batches):
         for jt in range(args.gradient_accumulate_every):
-            batch = next(dl)
+            feats, labels = next(dl)
+            residue_idx = rearrange(feats['residue_index'], 'c b -> b c')
+            seq = rearrange(feats['target_feat'], 'l b c -> b l c')
+            msa = rearrange(feats['msa_feat'], 'h l b c -> b h l c')
+            coords = rearrange(labels['coord'], 'l h b w -> b l h w')
+            print(residue_idx.shape)
+            print(seq.shape)
+            print(msa.shape)
+            print(coords.shape)
+            sys.exit(0)
             seq, coords, mask = batch.seqs, batch.crds, batch.msks
             logging.debug('seq.shape: {}'.format(seq.shape))
     
@@ -234,7 +239,7 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('-o', '--prefix', type=str, default='.', help='prefix of out directory, default=\'.\'')
-    parser.add_argument('-C', '--casp-version', type=int, default=12, help='CASP version, default=12')
+    parser.add_argument('-C', '--casp_version', type=str, default='.', help='CASP version, default=\'.\'')
     parser.add_argument('-F', '--features', type=str, default='esm', help='AA residue features one of [esm,msa], default=esm')
     parser.add_argument('-t', '--threads', type=int, default=0, help='number of threads used for intraop parallelism on CPU., default=0')
     parser.add_argument('-m', '--min_protein_len', type=int, default=50, help='filter out proteins whose length<LEN, default=50')
