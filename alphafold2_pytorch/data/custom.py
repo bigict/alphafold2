@@ -24,8 +24,11 @@ class ProteinStructureDataset(torch.utils.data.Dataset):
             self.protein_ids = list(map(str.rstrip, fin.readlines())) 
 
     def __getitem__(self, idx):
-        return (self.get_seq_features(self.protein_ids[idx]),
-            self.get_msa_features(self.protein_ids[idx]), self.get_structure_label(self.protein_ids[idx]))
+        pid = self.protein_ids[idx]
+        return dict(pid=pid, 
+                **self.get_seq_features(pid), 
+                **self.get_msa_features(pid),
+                **self.get_structure_label(pid))
 
     def __len__(self):
         return len(self.protein_ids)

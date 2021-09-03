@@ -10,30 +10,23 @@ from torch.optim import Adam
 from torch.utils.tensorboard import SummaryWriter
 from einops import rearrange
 
-# models & data
-
 from alphafold2_pytorch import constants
-from alphafold2_pytorch.data import scn,esm
-from alphafold2_pytorch.model import Alphafold2,sidechain
+from alphafold2_pytorch.data import esm,scn,custom
+from alphafold2_pytorch.model import Alphafold2,FeatureBuilder
 from alphafold2_pytorch.utils import *
 
 def main(args):
     # constants
-    
     DEVICE = constants.DEVICE # defaults to cuda if available, else cpu
     
-    DISTOGRAM_BUCKETS = constants.DISTOGRAM_BUCKETS
-
     if args.threads > 0:
         torch.set_num_threads(args.threads)
     
     # set emebdder model from esm if appropiate - Load ESM-1b model
-    
     if args.features == "esm":
         esm_extractor = esm.ESMEmbeddingExtractor(*esm.ESM_MODEL_PATH)
     
     # helpers
-    
     def cycle(loader, cond = lambda x: True):
         epoch = 0
         while True:
@@ -41,12 +34,12 @@ def main(args):
 
             data_iter = iter(loader)
             for data in data_iter:
-                yield data
+                if cond(data):
+                    yield data
 
             epoch += 1
     
     # get data
-    
     data = scn.load(
         max_seq_len = args.max_protein_len,
         casp_version = args.casp_version,
@@ -54,125 +47,83 @@ def main(args):
         with_pytorch = 'dataloaders',
         batch_size = args.batch_size,
         num_workers = 0,
-        dynamic_batching = False
-    )
+        dynamic_batching = False)
     
     train_loader = data['train']
-    data_cond = lambda t: args.min_protein_len <= t[1].shape[1] and t[1].shape[1] <= args.max_protein_len
-    dl = cycle(train_loader, data_cond)
+    dl = cycle(train_loader)
+
+    # features
+    feats_builder = FeatureBuilder(dict(
+            make_pseudo_beta={},
+            make_esm_embedd=dict(esm_extractor=esm_extractor, repr_layer=esm.ESM_EMBED_LAYER),
+            make_to_device=dict(
+                fields=['seq', 'mask', 'coord', 'coord_mask', 'pseudo_beta', 'pseudo_beta_mask'],
+                device=DEVICE)
+            ))
 
     # model
-    
     if args.alphafold2_continue:
         model = torch.load(os.path.join(args.prefix, 'model.pkl'))
         mode.eval()
         model.to(DEVICE)
     else:
+        headers = dict(distogram=(dict(buckets_first_break=2.3125, buckets_last_break=21.6875,
+                            buckets_num=constants.DISTOGRAM_BUCKETS), dict(weight=0.01)),
+                       folding=(dict(structure_module_depth=4, structure_module_heads=4,
+                            fape_min=args.alphafold2_fape_min, fape_max=args.alphafold2_fape_max, fape_z=args.alphafold2_fape_z), dict(weight=1.0)))
+
+        logging.info('Alphafold2.headers: {}'.format(headers))
+
         model = Alphafold2(
             dim = args.alphafold2_dim,
             depth = args.alphafold2_depth,
             heads = 8,
             dim_head = 64,
-            predict_coords = True,
-            predict_angles = True,
-            structure_module_depth = 2,
-            structure_module_heads = 4,
-            structure_module_dim_head = 16
+            predict_coords = False,
+            predict_angles = False,
+            headers = headers
         ).to(DEVICE)
-    #    structure_module_dim = 8,
-    #    structure_module_refinement_iters = 2
 
     # optimizer 
-    
-    dispersion_weight = 0.1
-    criterion = nn.MSELoss()
     optim = Adam(model.parameters(), lr = args.learning_rate)
     
     # tensorboard
     writer = SummaryWriter(os.path.join(args.prefix, 'runs', 'eval'))
     
     # training loop
-    
     for it in range(args.num_batches):
-        running_loss = 0
+        running_loss = {}
         for jt in range(args.gradient_accumulate_every):
-            batch = next(dl)
-            seq, mask, str_seqs, coords, coord_mask = batch['seq'], batch['mask'], batch['str_seq'], batch['coord'], batch['coord_mask']
+            batch = feats_builder.build(next(dl))
+
+            seq, mask = batch['seq'], batch['mask']
             logging.debug('seq.shape: {}'.format(seq.shape))
     
-            # prepare data and mask labels
-            seq, coords, mask, coord_mask = seq.to(DEVICE), coords.to(DEVICE), mask.to(DEVICE), coord_mask.to(DEVICE)
-            # coords = rearrange(coords, 'b (l c) d -> b l c d', l = l) # no need to rearrange for now
-            # mask the atoms and backbone positions for each residue
-    
             # sequence embedding (msa / esm / attn / or nothing)
-            msa, embedds = None, None
-    
-            # get embedds
-            if args.features == "esm":
-                data = list(zip(batch['pid'], str_seqs))
-                embedds = rearrange(
-                        esm_extractor.extract(data, repr_layer=esm.ESM_EMBED_LAYER, device=DEVICE),
-                        'b l c -> b () l c')
-            # get msa here
-            elif args.features == "msa":
-                pass 
-            # no embeddings 
-            else:
-                pass
-    
-            # predict - out is (batch, L * 3, 3)
-    
-            backbones = model(
+            msa, embedds = None, batch['emb_seq'] 
+            r = model(
                 seq,
                 mask = mask,
                 embedds = embedds,
-                msa = msa
-            )
+                msa = msa,
+                batch = batch)
     
             if it == 0 and jt == 0 and args.tensorboard_add_graph:
                 with SummaryWriter(os.path.join(args.prefix, 'runs', 'network')) as w:
                     w.add_graph(model, (seq, mask, embedds), verbose=True)
    
-            # atom mask
-            #_, atom_mask, _ = scn_backbone_mask(seq, boolean=True)
-            atom_mask = torch.zeros(scn.NUM_COORDS_PER_RES).to(seq.device)
-            atom_mask[..., 1] = 1
-    
-            ## build SC container. set SC points to CA and optionally place carbonyl O
-            proto_sidechain = sidechain.fold(str_seqs, backbones=backbones, atom_mask=atom_mask,
-                                                  cloud_mask=coord_mask, num_coords_per_res=scn.NUM_COORDS_PER_RES)
-    
-            #proto_sidechain = rearrange(proto_sidechain, 'b l c d -> b (l c) d')
-    
-            flat_cloud_mask = rearrange(coord_mask, 'b l c -> b (l c)')
-            # rotate / align
-            coords_aligned, labels_aligned = Kabsch(
-                    rearrange(proto_sidechain, 'b l c d -> b (l c) d')[flat_cloud_mask], 
-                    rearrange(coords, 'b l c d -> b (l c) d')[flat_cloud_mask])
-    
-            # save pdb files for visualization
-    
-            #if args.save_pdb: 
-            #    # idx from batch to save prot and label
-            #    idx = 0
-            #    coords2pdb(seq[idx, :, 0], coords_aligned[idx], cloud_mask, prefix=args.prefix, name="pred.pdb")
-            #    coords2pdb(seq[idx, :, 0], labels_aligned[idx], cloud_mask, prefix=args.prefix, name="label.pdb")
-    
-            weights = 1
-            # loss - RMSE + distogram_dispersion
-            #loss = torch.sqrt(criterion(coords_aligned[flat_chain_mask], labels_aligned[flat_chain_mask])) + \
-            #                  dispersion_weight * torch.norm( (1/weights)-1 )
-            #loss = torch.sqrt(criterion(coords_aligned, labels_aligned)) + \
-            #                  dispersion_weight * torch.norm( (1/weights)-1 )
-            loss = torch.clamp(torch.sqrt(criterion(coords_aligned, labels_aligned)), args.alphafold2_fape_min, args.alphafold2_fape_max) / args.alphafold2_fape_z
-            running_loss += loss.item()
+            # running loss
+            running_loss['all'] = running_loss.get('all', 0) + r.loss.item()
+            for h, v in r.headers.items():
+                if 'loss' in v:
+                    running_loss[h] = running_loss.get(h, 0) + v.get('loss').item()
 
-            loss.backward()
+            r.loss.backward()
     
-        running_loss /= (args.batch_size*args.gradient_accumulate_every)
-        logging.info('{} loss: {}'.format(it, running_loss))
-        writer.add_scalar('Loss/train', running_loss, it)
+        for k, v in running_loss.items():
+            v /= (args.batch_size*args.gradient_accumulate_every)
+            logging.info('{} loss@{}: {}'.format(it, k, v))
+            writer.add_scalar('Loss/train@{}'.format(k), v, it)
     
         optim.step()
         optim.zero_grad()

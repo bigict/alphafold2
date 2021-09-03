@@ -367,3 +367,31 @@ class MsaAttentionBlock(nn.Module):
         x = self.col_attn(x, mask = mask) + x
         return x
 
+class RelativePositionEmbedding(nn.Module):
+    def __init__(self, dim, max_rel_dist):
+        super().__init__()
+        self.max_rel_dist = max_rel_dist
+        self.embedding = nn.Embedding(max_rel_dist*2+1, dim)
+
+    def forward(self, seq_index):
+        seq_rel_dist = rearrange(seq_index, 'i -> () i ()') - rearrange(seq_index, 'j -> () () j')
+        seq_rel_dist = seq_rel_dist.clamp(-self.max_rel_dist, self.max_rel_dist) + self.max_rel_dist
+        return self.embedding(seq_rel_dist)
+
+class PairwiseEmbedding(nn.Module):
+    def __init__(self, dim, max_rel_dist = 0):
+        super().__init__()
+        self.to_pairwise_repr = nn.Linear(dim, dim*2)
+        self.relative_pos_emb = RelativePositionEmbedding(dim, max_rel_dist) if max_rel_dist > 0 else None
+
+    def forward(self, x, x_mask, seq_index = None):
+        (_, n), device = x.shape[:2], x.device
+
+        x_left, x_right = self.to_pairwise_repr(x).chunk(2, dim = -1)
+        x = rearrange(x_left, 'b i d -> b i () d') + rearrange(x_right, 'b j d-> b () j d') # create pair-wise residue embeds
+        x_mask = rearrange(x_mask, 'b i -> b i ()') * rearrange(x_mask, 'b j -> b () j') if exists(x_mask) else None
+        if self.relative_pos_emb:
+            seq_index = default(seq_index, lambda: torch.arange(n, device=device))
+            x += self.relative_pos_emb(seq_index)
+        return x, x_mask
+

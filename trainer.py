@@ -5,56 +5,25 @@ import logging
 import resource
 
 import torch
-from torch import nn
 from torch.optim import Adam
-from torch.nn import functional as F
 from torch.utils.tensorboard import SummaryWriter
-from einops import rearrange
 
 from alphafold2_pytorch import constants
-from alphafold2_pytorch.common import residue_constants
-from alphafold2_pytorch.data import esm,scn
-from alphafold2_pytorch.model import Alphafold2
-from alphafold2_pytorch.utils import *
-
-def pseudo_beta_fn(aatype, all_atom_positions, all_atom_masks):
-  """Create pseudo beta features."""
-
-  #all_atom_positions = all_atom_positions.reshape(:, scn.NUM_COORDS_PER_RES, ...)
-  #all_atom_positions = rearrange(all_atom_positions, 'b (l c) d -> b l c d', c=scn.NUM_COORDS_PER_RES)
-  #all_atom_positions = torch.split(all_atom_positions, scn.NUM_COORDS_PER_RES, dim=1)
-  #all_atom_positions = torch.stack(all_atom_positions, dim=1)
-  is_gly = torch.eq(aatype, residue_constants.restype_order['G'])
-  ca_idx = residue_constants.atom_order['CA']
-  cb_idx = residue_constants.atom_order['CB']
-  pseudo_beta = torch.where(
-      torch.tile(is_gly[..., None], [1] * len(is_gly.shape) + [3]),
-      all_atom_positions[..., ca_idx, :],
-      all_atom_positions[..., cb_idx, :])
-
-  if all_atom_masks is not None:
-    pseudo_beta_mask = torch.where(
-        is_gly, all_atom_masks[..., ca_idx], all_atom_masks[..., cb_idx])
-    pseudo_beta_mask = pseudo_beta_mask.float()
-    return pseudo_beta, pseudo_beta_mask
-  else:
-    return pseudo_beta
+from alphafold2_pytorch.data import esm,scn,custom
+from alphafold2_pytorch.model import Alphafold2,FeatureBuilder
 
 def main(args):
     # constants
-    
     DEVICE = constants.DEVICE # defaults to cuda if available, else cpu
     
     if args.threads > 0:
         torch.set_num_threads(args.threads)
     
     # set emebdder model from esm if appropiate - Load ESM-1b model
-    
     if args.features == "esm":
         esm_extractor = esm.ESMEmbeddingExtractor(*esm.ESM_MODEL_PATH)
     
     # helpers
-    
     def cycle(loader, cond = lambda x: True):
         epoch = 0
         while True:
@@ -68,27 +37,38 @@ def main(args):
             epoch += 1
     
     # get data
-    
     data = scn.load(
+        max_seq_len = args.max_protein_len,
         casp_version = args.casp_version,
         thinning = 30,
         with_pytorch = 'dataloaders',
         batch_size = args.batch_size,
         num_workers = 0,
-        dynamic_batching = False
-    )
+        dynamic_batching = False)
     
     train_loader = data['train']
-    data_cond = lambda t: True #args.min_protein_len <= t[1].shape[1] and t[1].shape[1] <= args.max_protein_len
-    dl = cycle(train_loader, data_cond)
+    dl = cycle(train_loader)
+
+    # features
+    feats_builder = FeatureBuilder(dict(
+            make_pseudo_beta={},
+            make_esm_embedd=dict(esm_extractor=esm_extractor, repr_layer=esm.ESM_EMBED_LAYER),
+            make_to_device=dict(
+                fields=['seq', 'mask', 'coord', 'coord_mask', 'pseudo_beta', 'pseudo_beta_mask'],
+                device=DEVICE)
+            ))
 
     # model
-    
     if args.alphafold2_continue:
         model = torch.load(os.path.join(args.prefix, 'model.pkl'))
         mode.eval()
         model.to(DEVICE)
     else:
+        headers = dict(distogram=(dict(buckets_first_break=2.3125, buckets_last_break=21.6875,
+                            buckets_num=constants.DISTOGRAM_BUCKETS), dict(weigth=1.0)))
+
+        logging.info('Alphafold2.headers: {}'.format(headers))
+
         model = Alphafold2(
             dim = args.alphafold2_dim,
             depth = args.alphafold2_depth,
@@ -96,84 +76,49 @@ def main(args):
             dim_head = 64,
             predict_coords = False,
             predict_angles = False,
-            structure_module_depth = 2,
-            structure_module_heads = 4,
-            structure_module_dim_head = 16,
-            headers = {'distogram': ({'dim': args.alphafold2_dim,
-                    'first_break': 2.3125, 
-                    'last_break': 21.6875,
-                    'num_buckets': constants.DISTOGRAM_BUCKETS}, {'weigth': 1.0})}
+            headers = headers
         ).to(DEVICE)
-    #    structure_module_dim = 8,
-    #    structure_module_refinement_iters = 2
 
     # optimizer 
-    
     optim = Adam(model.parameters(), lr = args.learning_rate)
     
     # tensorboard
     writer = SummaryWriter(os.path.join(args.prefix, 'runs', 'eval'))
     
     # training loop
-    
     for it in range(args.num_batches):
-        running_loss = 0
+        running_loss = {}
         for jt in range(args.gradient_accumulate_every):
-            batch = next(dl)
-            pids, seq, mask, str_seqs, coords, coord_masks = batch['pid'], batch['seq'], batch['mask'], batch['str_seq'], batch['coord'], batch['coord_mask']
+            batch = feats_builder.build(next(dl))
+
+            seq, mask = batch['seq'], batch['mask']
             logging.debug('seq.shape: {}'.format(seq.shape))
     
-            # prepare data and mask labels
-            seq, mask, coords, coord_masks = seq.to(DEVICE), mask.to(DEVICE), coords.to(DEVICE), coord_masks.to(DEVICE)
-            # coords = rearrange(coords, 'b (l c) d -> b l c d', l = l) # no need to rearrange for now
-            # mask the atoms and backbone positions for each residue
-    
             # sequence embedding (msa / esm / attn / or nothing)
-            msa, embedds = None, None
-    
-            # get embedds
-            if args.features == "esm":
-                data = list(zip(pids, str_seqs))
-                embedds = rearrange(
-                        esm_extractor.extract(data, repr_layer=esm.ESM_EMBED_LAYER, device=DEVICE),
-                        'b l c -> b () l c')
-            # get msa here
-            elif args.features == "msa":
-                pass 
-            # no embeddings 
-            else:
-                pass
-    
-            pseudo_beta, pseudo_beta_mask = pseudo_beta_fn(seq, coords, coord_masks)
-            batch = {'pseudo_beta': pseudo_beta,
-                    'pseudo_beta_mask': pseudo_beta_mask}
-            # predict - out is (batch, L * 3, 3)
-    
+            msa, embedds = None, batch['emb_seq'] 
             r = model(
                 seq,
                 mask = mask,
                 embedds = embedds,
                 msa = msa,
-                batch = batch
-            )
+                batch = batch)
     
             if it == 0 and jt == 0 and args.tensorboard_add_graph:
                 with SummaryWriter(os.path.join(args.prefix, 'runs', 'network')) as w:
                     w.add_graph(model, (seq, mask, embedds), verbose=True)
    
-            # atom mask
-            #_, atom_mask, _ = scn_backbone_mask(seq, boolean=True)
-            atom_mask = torch.zeros(scn.NUM_COORDS_PER_RES).to(seq.device)
-            atom_mask[..., 1] = 1
+            # running loss
+            running_loss['all'] = running_loss.get('all', 0) + r.loss.item()
+            for h, v in r.headers.items():
+                if 'loss' in v:
+                    running_loss[h] = running_loss.get(h, 0) + v.get('loss').item()
 
-            # loss - distogram_dispersion
-            running_loss += r.loss.item()
             r.loss.backward()
     
-        running_loss /= (args.gradient_accumulate_every*args.batch_size)
-        logging.info('{} loss: {}'.format(it, running_loss))
-        writer.add_scalar('Loss/train', running_loss, it)
-        running_loss = 0
+        for k, v in running_loss.items():
+            v /= (args.batch_size*args.gradient_accumulate_every)
+            logging.info('{} loss@{}: {}'.format(it, k, v))
+            writer.add_scalar('Loss/train@{}'.format(k), v, it)
     
         optim.step()
         optim.zero_grad()
